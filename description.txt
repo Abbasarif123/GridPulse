@@ -1,1 +1,0 @@
-GridPulse (Industrial Edition) is an autonomous, AI-driven Energy Management System (EMS) designed for large industrial manufacturing facilities and commercial parks equipped with a utility-scale Battery Energy Storage System (BESS) 
