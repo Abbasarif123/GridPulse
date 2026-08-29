@@ -1,19 +1,20 @@
 import pulp
 import pandas as pd
 import numpy as np
-
+#energy unit -> kW time-> h currency -> euro
 class IndustrialBatteryOptimizer:
     def __init__(
         self,
         capacity_kwh: float = 500.0,
         max_power_kw: float = 250.0,      # max charge discharge rate
         efficiency: float = 0.92,         # round trip efficiency factor
-        min_soc_pct: float = 0.10,        #lower SOC limit to prevent discharge degradation
-        max_soc_pct: float = 0.90,        #upper SOC limit to prevent overcharge degradation
+        min_soc_pct: float = 0.10,        #lower SOC limit to prevent discharge degradation (10%)
+        max_soc_pct: float = 0.90,        #upper SOC limit to prevent overcharge degradation (90%)
         initial_soc_kwh: float = 250.0,
-        degradation_cost_per_kwh: float = 0.02,  # cell wear penalty (~2ct/kWh throughput)
-        peak_penalty_per_kw: float = 12.0 # Monthly/daily peak demand fee weighting
+        degradation_cost_per_kwh: float = 0.02,  # cell wear penalty
+        peak_penalty_per_kw: float = 12.0 #demand charge applied to the highest grid draw
     ):
+        #physical and operational system boundaries
         self.capacity_kwh = capacity_kwh
         self.max_power_kw = max_power_kw
         self.eff = efficiency
@@ -25,57 +26,74 @@ class IndustrialBatteryOptimizer:
 
     def optimize(self, price_curve: list[float], factory_load: list[float], dt_hours: float = 1.0) -> pd.DataFrame:
         """
-        Solves the MILP for a given time horizon.
-        :param price_curve: Electricity spot price in €/kWh for each timestep.
-        :param factory_load: Factory baseline consumption in kW for each timestep.
-        :param dt_hours: Time resolution per interval (1.0 = hourly, 0.25 = 15-min).
+        Solves the MILP for a given time horizon
+            param price_curve: electricity spot price in for each timestep
+            param factory_load: factory baseline consumption in for each timestep
+            param dt_hours: Time resolution per interval (1.0 = hourly)
         """
         T = len(price_curve)
         time_steps = range(T)
 
         prob = pulp.LpProblem("Industrial_GridPulse_Optimization", pulp.LpMinimize)
 
-        # Decision Variables
+        #DECISION VARIABLES
+        #power charge rate at step t
         p_charge = pulp.LpVariable.dicts("P_Charge", time_steps, lowBound=0, upBound=self.max_power_kw)
+        #power discharge rate at step t
         p_discharge = pulp.LpVariable.dicts("P_Discharge", time_steps, lowBound=0, upBound=self.max_power_kw)
-        p_grid = pulp.LpVariable.dicts("P_Grid", time_steps, lowBound=0) # Power imported from grid
+        #net power imported from the external grid at step t
+        p_grid = pulp.LpVariable.dicts("P_Grid", time_steps, lowBound=0) 
         soc = pulp.LpVariable.dicts("SOC", range(T + 1), lowBound=self.min_soc, upBound=self.max_soc)
+        #battery  energy stored at step boundary t
         
-        # Binary flags to strictly prevent simultaneous charge & discharge
+        #binary indicator 0 for discharging mode 1 for charging mode
         is_charging = pulp.LpVariable.dicts("IsCharging", time_steps, cat=pulp.LpBinary)
         
-        # Peak power variable across the horizon
+        #max grid power drawn across all time steps
         peak_grid_power = pulp.LpVariable("Peak_Grid_Power", lowBound=0)
 
-        # Initial SOC boundary
+        #CONSTRAINTS
+
+        # starting state of charge
         prob += soc[0] == self.initial_soc
 
         for t in time_steps:
-            # 1. State of Charge Dynamics: SOC(t+1) = SOC(t) + (P_ch * eff - P_dis / eff) * dt
+            # state of charge dynamics: SOC(t+1) = SOC(t) + (P_ch * eff - P_dis / eff) * dt
+            #this accounts for conversion losses during charging and discharging
             prob += soc[t + 1] == soc[t] + (p_charge[t] * self.eff - p_discharge[t] / self.eff) * dt_hours
 
-            # 2. Power Balance: Grid + Discharge = Factory Load + Charge
+            # power balance : Grid + Discharge = Factory Load + Charge  (KIRCHOFFS LAW)
+            #total power IN == total power OUT
             prob += p_grid[t] + p_discharge[t] == factory_load[t] + p_charge[t]
 
-            # 3. Prevent simultaneous charge/discharge via Big-M constraint
+            # prevent simultaneous charge and discharge via Big-M constraint
+            #if is_charging[t] == 1: p_charge <= Max, p_discharge <= 0 
+            #if is_charging[t] == 0: p_charge <= 0, p_discharge <= max 
             prob += p_charge[t] <= self.max_power_kw * is_charging[t]
             prob += p_discharge[t] <= self.max_power_kw * (1 - is_charging[t])
 
-            # 4. Peak grid tracking
+            # peak grid tracking
+            #max(p_grid[0], p_grid[1], ..., p_grid[T-1])
             prob += peak_grid_power >= p_grid[t]
 
-        # Objective Function: Minimize (Energy Purchase Cost + Battery Wear + Peak Demand Charges)
+        # OBJECTIVE FUNCTION: Minimize (Energy Purchase Cost + Battery Wear + Peak Demand Charges)
+        
         energy_cost = pulp.lpSum([p_grid[t] * price_curve[t] * dt_hours for t in time_steps])
         degradation_cost = pulp.lpSum([(p_charge[t] + p_discharge[t]) * self.deg_cost * dt_hours for t in time_steps])
+
+        #capacity or demand tarrif charged against the highest single peak power import
         peak_charge = peak_grid_power * self.peak_penalty
 
         prob += energy_cost + degradation_cost + peak_charge
 
-        # Solve using HiGHS or CBC
+        #SOLVE
+        #invoke the default CBC MILP solver
         solver = pulp.PULP_CBC_CMD(msg=False)
         prob.solve(solver)
 
-        # Parse Results into a Clean DataFrame
+        #POST PROCESSING AND METRICS
+
+        #extract the optimised value into a structured time series
         results = []
         for t in time_steps:
             results.append({
@@ -91,11 +109,14 @@ class IndustrialBatteryOptimizer:
 
         df = pd.DataFrame(results)
         
-        # Financial Comparison
+        #FINANCIAL COMPARISON
+
+        #baseline calculation:faactory operating without battery intervention
         baseline_energy_cost = sum(np.array(factory_load) * np.array(price_curve) * dt_hours)
         baseline_peak_cost = max(factory_load) * self.peak_penalty
         baseline_total = baseline_energy_cost + baseline_peak_cost
 
+        #optimised calculation: actual costs including battery operational expenditure and degredation
         opt_energy_cost = sum(df["p_grid_kw"] * df["price_eur_kwh"] * dt_hours)
         opt_peak_cost = df["p_grid_kw"].max() * self.peak_penalty
         opt_deg_cost = sum((df["p_charge_kw"] + df["p_discharge_kw"]) * self.deg_cost * dt_hours)
@@ -103,6 +124,7 @@ class IndustrialBatteryOptimizer:
 
         savings_pct = ((baseline_total - opt_total) / baseline_total) * 100
 
+        #summary KPI comparing baseline vs optimised
         metrics = {
             "baseline_total_cost": baseline_total,
             "optimized_total_cost": opt_total,
