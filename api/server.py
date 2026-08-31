@@ -61,6 +61,7 @@ class MicrogridState:
         self.sim_hour = 14
 
     def to_dict(self):
+        """serializes current state values into a clean dictionary with rounded floats"""
         return {
             "capacity_kwh": self.capacity_kwh,
             "max_power_kw": self.max_power_kw,
@@ -76,67 +77,67 @@ class MicrogridState:
             "sim_hour": self.sim_hour,
         }
 
-
+#microgrid state shared across HTTP requests and websocket streams
 state = MicrogridState()
 
 
-# --- 3. Background Telemetry Engine Loop ---
+#BACKGROUND TELEMETRY SIMULATION LOOP
 async def telemetry_simulation_loop():
-    """Simulates 1-second ticks representing real-time microgrid dynamics."""
+    """Simulates 1-second ticks representing real-time microgrid dynamics,heuristic battery dispatch and real time metrics to connected clients"""
     while True:
+        #non blocking tick pause
         await asyncio.sleep(1.0)
-        
-        # Add realistic sensor fluctuations
+
+        #injecting stochastic variations to simulate real sensor noise        
         state.factory_load_kw = max(100.0, state.factory_load_kw + random.uniform(-15.0, 15.0))
         state.pv_generation_kw = max(0.0, state.pv_generation_kw + random.uniform(-5.0, 5.0))
         
-        # Net power required before battery intervention
+        # net load that is served after deducting solar generation
         net_factory_need = state.factory_load_kw - state.pv_generation_kw
         
-        # Simple autonomous dispatch logic for simulation
+        # real time heuristic dispatch logic
         if state.mode == "AUTONOMOUS_ARBITRAGE":
             if state.spot_price_eur_kwh > 0.25 and state.current_soc_pct > 15:
-                # Discharging during peak prices
+                # discharge during price peaks to offset expensive grid import
                 state.battery_power_kw = min(state.max_power_kw, net_factory_need * 0.7)
             elif state.spot_price_eur_kwh < 0.08 and state.current_soc_pct < 90:
-                # Charging during valley prices
+                # charging during dip in price
                 state.battery_power_kw = -min(state.max_power_kw, 150.0)
             else:
-                state.battery_power_kw = 0.0
+                state.battery_power_kw = 0.0 #otherwise idle
         
-        # Update SOC dynamics
-        # dt = 1s = 1/3600 h
-        delta_kwh = (-state.battery_power_kw * (1.0 / 3600.0))
-        state.current_soc_kwh = max(60.0, min(state.capacity_kwh * 0.95, state.current_soc_kwh + delta_kwh))
+        #updating the SOC dynamics over the 1 second interval
+        delta_kwh = (-state.battery_power_kw * (1.0 / 3600.0)) #1 second
+        state.current_soc_kwh = max(60.0, min(state.capacity_kwh * 0.95, state.current_soc_kwh + delta_kwh))#enfore buffer limits 10 to 90%
         state.current_soc_pct = (state.current_soc_kwh / state.capacity_kwh) * 100
         
-        # Grid power balances everything: Grid = Factory - PV - Battery
+        #grid power balances everything: Grid = Factory - PV - Battery
         state.grid_power_kw = max(0.0, net_factory_need - state.battery_power_kw)
         
-        # Increment simulated savings
+        #compute financial savings per second tick
         baseline_cost_tick = (net_factory_need * (1.0 / 3600.0)) * state.spot_price_eur_kwh
         actual_cost_tick = (state.grid_power_kw * (1.0 / 3600.0)) * state.spot_price_eur_kwh
         state.cumulative_savings_eur += max(0.0, baseline_cost_tick - actual_cost_tick)
 
-        # Broadcast live frame to all connected WebSockets
+        #broadcast live frame to all connected WebSockets
         await manager.broadcast({
             "type": "TELEMETRY_UPDATE",
             "data": state.to_dict()
         })
 
-
+#FASTAPI APPLICATION LIFESPAN AND INITIALISATION
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Launch background telemetry task
+    #create the non blocking background telemetry simulation task
     task = asyncio.create_task(telemetry_simulation_loop())
     yield
-    # Shutdown
+    #shutdown
     task.cancel()
 
 
-# --- 4. FastAPI Application ---
+#fast api application
 app = FastAPI(title="GridPulse Telemetry Engine", lifespan=lifespan)
-
+#enable cross origin resource sharing for local frontend dashboard
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -146,7 +147,7 @@ app.add_middleware(
 )
 
 
-# --- 5. REST & WebSocket Endpoints ---
+#REST API ENDPOINTS
 @app.get("/api/state")
 async def get_state():
     return state.to_dict()
@@ -171,24 +172,27 @@ async def update_control(req: ControlRequest):
 @app.post("/api/optimize/24h")
 async def run_24h_optimization():
     """Runs full MILP schedule and returns the 24-hour plan."""
-    # Standard 24h profiles for testing
+    #test 24 hour day ahead spot price profile
     spot_prices = [
         0.08, 0.06, 0.05, 0.04, 0.05, 0.09,
         0.18, 0.32, 0.38, 0.28, 0.22, 0.20,
         0.16, 0.14, 0.12, 0.15, 0.22, 0.35,
         0.42, 0.39, 0.29, 0.20, 0.14, 0.10
     ]
+    #test 24 hour day factory load profile profile
     factory_load = [
         120, 110, 110, 110, 120, 180,
         300, 420, 480, 400, 380, 390,
         350, 490, 450, 380, 320, 280,
         220, 200, 160, 140, 130, 120
     ]
-    
+
+    #instantiate the optimiser using current live battery specs
     optimizer = IndustrialBatteryOptimizer(
         capacity_kwh=state.capacity_kwh,
         max_power_kw=state.max_power_kw
     )
+    #solve the MILP model
     df, metrics = optimizer.optimize(spot_prices, factory_load)
     
     return {
@@ -196,18 +200,19 @@ async def run_24h_optimization():
         "schedule": df.to_dict(orient="records")
     }
 
-
+#websocket endpoint
 @app.websocket("/ws/telemetry")
 async def websocket_endpoint(websocket: WebSocket):
     await manager.connect(websocket)
-    # Send initial state immediately upon connecting
+    # immediately emit current state snapshot upon initial handshake
     await websocket.send_json({"type": "INITIAL_STATE", "data": state.to_dict()})
     try:
         while True:
-            # Keep listener open for incoming client control messages
+            # listen asynchronously for incoming JSON control messages from the client
             data = await websocket.receive_text()
             payload = json.loads(data)
             if payload.get("action") == "SET_MODE":
                 state.mode = payload.get("mode", state.mode)
     except WebSocketDisconnect:
+        #deregister upon close or network drop
         manager.disconnect(websocket)
