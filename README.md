@@ -1,6 +1,6 @@
 # GridPulse 
 
-![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)
+
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![React 19](https://img.shields.io/badge/React-19-61dafb?logo=react&logoColor=black)
 ![Tailwind 4](https://img.shields.io/badge/Tailwind-4.0-38B2AC?logo=tailwind-css&logoColor=white)
