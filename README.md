@@ -121,3 +121,6 @@ In simulated historical backtests across the DE-LU (Germany/Luxembourg) bidding 
 
 * ~21-25% reduction in total daily electricity costs.
 * Successful clamping of factory peak loads, avoiding high-tier peak demand penalties.
+
+## FINAL RESULT 
+![alt text](<Screenshot From 2026-08-31 12-58-25.png>)
